@@ -873,7 +873,7 @@ RuntimeCompat：可用进程数
     }
   }
 ```
-SizeConfigStrategy:  
+SizeConfigStrategy:重用bitmap字节大小的位图，提高了位图池命中率
 * RGBA_F16_IN_CONFIGS数组:{Bitmap.Config.ARGB_8888,null,Bitmap.Config.RGBA_F16}
 * ARGB_8888_IN_CONFIGS数组:{Bitmap.Config.ARGB_8888,null}
 * RGB_565_IN_CONFIGS数组:{Bitmap.Config.RGB_565}
@@ -886,6 +886,7 @@ SizeConfigStrategy:
 > ARGB_8888:每个像素被存储为4个字节。每个通道存储为8位(256个可能值)
 > RGBA_F16:每个像素被存储为8个字节。每个通道存储为高精度的浮点值。这个配置适合宽色域和HDR内容
 > HEADWARE:位图仅存储在图形内存中的特殊配置。这个配置的位图不可变，在屏幕上绘制是最优的
+* 查找最优Key:
 ```java
   @RequiresApi(Build.VERSION_CODES.KITKAT)
   public class SizeConfigStrategy implements LruPoolStrategy{
@@ -1077,7 +1078,7 @@ SizeConfigStrategy:
     }
   }
 ```
-AttributeStrategy
+AttributeStrategy:重用宽度、高度、Bitmap.Config都一样的bitmap
 ```java
   class AttributeStrategy implements LruPoolStrategy{
     private final KeyPool keyPool=new KeyPool();
@@ -1437,7 +1438,134 @@ GroupedLinkedMap:类似LinkedHashMap，思想：找到LRU位图大小，而不�
   }
   
 ```
-
+LruArrayPool:使用最近最少使用策略维持一个固定大小的数组池
+```java
+  public final class LruArrayPool implements ArrayPool {
+    //4MB
+    private static final int DEFUALT_SIZE=4*1024*1024;
+    //int数组的最大倍数可以大于从池中返回的请求大小
+    static final int MAX_OVER_SIZE_MULTIPLE=8;
+    //用于计算单个字节数组可能消耗总池的最大百分比
+    private static final int SINGLE_ARRAY_MAX_SIZE_DIVISOR=2;
+    private final GroupedLinkedMap<Key,Object> groupedMap=new GroupedLinkedMap<>();
+    private final KeyPool keyPool=new KeyPool();
+    private final Map<Class<?>,NavigableMap<Integer,Integer>> sortedSizes=new HashMap<>();
+    private final Map<Class<?>,ArrayAdapterInterface<?>> adapters=new HashMap<>();
+    private final int maxSize;
+    private int currentSize;
+    
+    public LruArrayPool(){
+      maxSize=DEFAULT_SIZE;
+    }
+    public LruArrayPool(int maxSize){
+      this.maxSize=maxSize;
+    }
+    @Deprecated
+    @Override
+    public <T> void put(T array,Class<T> arrayClass){
+      put(array);
+    }
+    @Override
+    public synchronized <T> void put(T array){
+      Class<T> arrayClass=(Class<T>)array.getClass();
+      ArrayAdapterInterface<T> arrayAdapter=getAdapterFromType(arrayClass);
+      int size=arrayAdapter.getArrayLength(array);
+      int arrayBytes=size*arrayAdapter.getElementSizeInBytes();
+      if(!isSmallEnoughForReuse(arrayBytes)){
+        return;
+      }
+      Key key=keyPool.get(size,arrayClass);
+      groupedMap.put(key,array);
+      NavigableMap<Integer,Integer> sizes=getSizesForAdapter(arrayClass);
+      Integer current =sizes.get(key.size);
+      sizes.put(key.size,current==null?1:current+1);
+      currentSize+=arrayBytes;
+      evict();
+    }
+    @Override
+    public synchronized <T> T getExact(int size,Class<T> arrayClass){
+      Key key=keyPool.get(size,arrayClass);
+      return getForKey(key,arrayClasss);
+    }
+    @Override
+    public synchronized <T> T get(int size,Class<T> arrayClass){
+      Integer possibleSize=getSizesForAdapter(arrayClass).ceilingKey(size);
+      final Key key;
+      if(mayFillRequest(szie,possibleSize)){
+        key=keyPool.get(possibleSize,arrayClass);
+      }else{
+        key=keyPool.get(size,arrayClass);
+      }
+      return getForKey(key,arrayClass);
+    }
+    private <T> T getForKey(Key key,Class<T> arrayClass){
+      ArrayAdapterInterface<T> arrayAdapter=getAdapterFromType(arrayClass);
+      T result=getArrayForKey(key);
+      if(result!=null){
+        currentSize-=arrayAdapter.getArrayLength(result)*arrayAdapter.getElementSizeInBytes();
+        decrementArrayOfSize(arrayAdapter.getArrayLength(result),arrayClass);
+      }
+      if(resutl==null){
+        if(Log.isLoggable(arrayAdapter.getTag(),Log.VERBOSE)){
+          Log.v(arrayAdpate.getTag(),"Allocated "+key.size+" bytes");
+        }
+        result=arrayAdapter.newArray(key.size);
+      }
+      return result;
+    }
+    @Nullable
+    private <T> T getArrayForKey(Key key){
+      return (T) groupedMap.get(key);
+    }
+    private boolean isSmallEnoughForReuse(int byteSize){
+      return byteSize <=maxSize/SINGLE_ARRAY_MAX_SIZE_DIVISOR;
+    }
+    private boolean mayFillRequest(int requestedSize,Integer actualSize){
+      return actualSize!=null&&(isNoMoreThanHalfFull()||actualSize<=(MAX_OVER_SIZE_MULTIPLE*requestedSize));
+    }
+    private boolean isNoMoreThanHalfFull(){
+      return currentSize==0||(maxSize/currentSize>=2);
+    }
+    @Override
+    public synchronized void clearMemory(){
+      evictToSize(0);
+    }
+    @Override
+    public synchronized void trimMemory(int level){
+      if(level>=android.content.ComponentCallbacks2.TRIM_MEMORY_BACKGROUND){
+        clearMemory();
+      }else if(level>=android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN||level==android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL){
+        evictToSize(maxSize/2);
+      }
+    }
+    private void evict(){
+      evictToSize(maxSize);
+    }
+    private void evictToSize(int size){
+      while(currentSize>size){
+        Object evicted=groupedMap.removeLast();
+        Preconditions.checkNotNull(evicted);
+        ArrayAdapterInterface<Object> arrayAdapter=getAdapterFromObject(evicted);
+        currentSize-=arrayAdapter.getArrayLength(evicted)*arrayAdapter.getElementSizeInBytes();
+        decrementArrayOfSize(arrayAdapter.getArrayLength(evicted),evicted.getClass());
+      }
+    }
+    private void decrementArrayOfSize(int size,Class<?> arrayClass){
+      NavigableMap<Integer,Integer> sizes=getSizesForAdapter(arrayClass);
+      Integer current = size.get(size);
+      if(current==null){
+        throw new NullPointerException("Tried to decrement empty size, size: "+size+",this:"+this);
+      }
+      if(current==1){
+        sizes.remove(size);
+      }else{
+        sizes.put(size,current-1);
+      }
+    }
+    
+    
+  }
+```
 
 
 
